@@ -1,0 +1,14 @@
+{
+  "name": "reddit-parser-mcpb",
+  "version": "0.5.1",
+  "description": "MCP server wrapping the reddit-parser Python CLI for Claude Desktop.",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.2"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,21 @@
+# Node.js
+node_modules/
+
+# Built MCP bundles (build with `npm install` + zip from mcpb-src/)
+*.mcpb
+*.dxt
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor swap
+*.swp
+*~
+
+# Claude Code project state (local only)
+.claude/
