@@ -236,8 +236,10 @@ def liveness_check(item_data, max_age_days=None):
                 return "likely_archived", f"posted {int(age_days)}d ago (>{max_age_days}d archive threshold)"
     score = item_data.get("score")
     num_comments = item_data.get("num_comments", 0)
-    if score == 0 and num_comments and num_comments > 5:
-        return "suspicious", f"score=0 with {num_comments} comments (likely mod-removed or snapshot pre-vote)"
+    # score=0 with ANY non-zero comments is suspicious. Filter-removed posts often have
+    # 1–3 comments — the filter catches them early but doesn't strip pre-removal replies.
+    if score == 0 and num_comments and num_comments > 0:
+        return "suspicious", f"score=0 with {num_comments} comments (filter/mod-removed pattern)"
     return "live", ""
 
 
@@ -271,11 +273,20 @@ _PLAYWRIGHT_UA = (
 
 
 def _classify_live_text(text):
-    t = (text or "").lower()
+    t = (text or "").lower().replace("’", "'")  # normalize curly apostrophe
     if "deleted by the person who originally posted" in t or "deleted by the user" in t:
         return "deleted", "live page: user-deleted"
-    if "removed by the moderators" in t or "removed by reddit" in t or "removed by a moderator" in t:
+    # Order matters: more-specific phrases first, since they overlap with the generic ones.
+    if "removed by reddit's filters" in t or "removed by reddit's automod" in t:
+        return "removed", "live page: removed by Reddit's automated filter"
+    if "removed by the moderators" in t or "removed by a moderator" in t:
         return "removed", "live page: mod-removed"
+    if "removed by anti-evil operations" in t or "removed by reddit's anti-evil" in t:
+        return "removed", "live page: removed by Anti-Evil Operations"
+    if "removed by reddit" in t:
+        return "removed", "live page: removed by Reddit admins"
+    if "this account has been suspended" in t or "account was suspended" in t:
+        return "removed", "live page: author account suspended"
     if "archived post" in t:
         return "archived", "live page: archived"
     if "locked post" in t or "comment locked" in t:
