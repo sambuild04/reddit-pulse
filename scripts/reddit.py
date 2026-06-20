@@ -323,9 +323,23 @@ def verify_live_status(children, mode):
             page = ctx.new_page()
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=20000)
-                page.wait_for_timeout(1500)
+                # New Reddit hydrates after DOMContentLoaded — status banners appear
+                # only once React finishes rendering. Give the network a chance to settle,
+                # then add a fixed buffer for the banner to mount.
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass  # reddit rarely reaches networkidle; that's fine
+                page.wait_for_timeout(2500)
                 text = page.evaluate("() => document.body.innerText")
-                children[i]["_liveness"] = _classify_live_text(text)
+                status, reason = _classify_live_text(text)
+                # If we got "live" but the page text is implausibly short, the banner
+                # likely hasn't rendered yet — wait once more and re-read.
+                if status == "live" and len(text) < 400:
+                    page.wait_for_timeout(2500)
+                    text = page.evaluate("() => document.body.innerText")
+                    status, reason = _classify_live_text(text)
+                children[i]["_liveness"] = (status, reason)
             except Exception as e:
                 children[i]["_liveness"] = ("unknown", f"verify failed: {str(e)[:60]}")
             finally:
