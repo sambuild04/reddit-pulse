@@ -1,6 +1,6 @@
 {
   "name": "reddit-parser-mcpb",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "MCP server wrapping the reddit-parser Python CLI for Claude Desktop.",
   "type": "module",
   "main": "server/index.js",

@@ -294,6 +294,43 @@ def _classify_live_text(text):
     return "live", "live page: verified"
 
 
+def verify_live_one(url):
+    """Open one URL in headless Chromium and return (status, reason).
+    Same banner-reading logic as verify_live_status but for a single post.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        die(
+            "verify_live requires Playwright. Install:\n"
+            "  pip3 install --user playwright\n"
+            "  python3 -m playwright install chromium"
+        )
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(user_agent=_PLAYWRIGHT_UA, viewport={"width": 1280, "height": 800})
+        page = ctx.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2500)
+            text = page.evaluate("() => document.body.innerText")
+            status, reason = _classify_live_text(text)
+            if status == "live" and len(text) < 400:
+                page.wait_for_timeout(2500)
+                text = page.evaluate("() => document.body.innerText")
+                status, reason = _classify_live_text(text)
+            return status, reason
+        except Exception as e:
+            return "unknown", f"verify failed: {str(e)[:60]}"
+        finally:
+            page.close()
+            browser.close()
+
+
 def verify_live_status(children, mode):
     """Open each candidate's permalink in a headless browser and overwrite ._liveness
     with ground truth. mode: 'suspect' (only heuristic non-live) or 'all'.
@@ -530,7 +567,22 @@ def cmd_post(args):
         post = j[0]["data"]["children"][0]["data"]
         comments = j[1]["data"]["children"]
 
+    # Optional live-status check via Playwright. Important for `get_post`: Arctic
+    # Shift's snapshot still has the original body even for posts the OP later deleted
+    # or mods later removed. Without this check, the model gets the archived body and
+    # has no way to know the post is no longer engageable on Reddit.
+    live_status = live_reason = None
+    if getattr(args, "verify_live", "none") != "none":
+        permalink = post.get("permalink", "")
+        verify_url = ("https://www.reddit.com" + permalink) if permalink.startswith("/") else permalink
+        print(f"# verify-live: probing live status of {verify_url}…", file=sys.stderr)
+        live_status, live_reason = verify_live_one(verify_url)
+
     out = [f"# {post['title']}  _(via {via})_", ""]
+    if live_status and live_status != "live":
+        out.append(f"> ⚠ **This post is currently `{live_status}` on Reddit.** {live_reason}.")
+        out.append("> The body below is from an archived snapshot; the post is no longer engageable.")
+        out.append("")
     out.append(
         f"r/{post['subreddit']} • by u/{post['author']} • score {post['score']} • {post['num_comments']} comments"
     )

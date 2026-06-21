@@ -83,7 +83,8 @@ const TOOLS = {
     ],
   },
   get_post: {
-    description: "Fetch a single Reddit post (full body + top comments tree) by URL or bare post id.",
+    description:
+      "Fetch a single Reddit post — full body + top comments tree — by URL or bare post id. By default verifies the post's current live status by opening the URL in a headless browser. If the post was deleted by OP, mod-removed, filter-removed, or archived since the Arctic Shift snapshot, a prominent warning header is prepended so you know the body shown is from an archived snapshot and the post is no longer engageable.",
     inputSchema: {
       type: "object",
       properties: {
@@ -91,13 +92,25 @@ const TOOLS = {
         limit: { type: "integer", default: 20, description: "Max number of top comments" },
         depth: { type: "integer", default: 2, description: "Max comment nesting depth" },
         via: { type: "string", enum: ["auto", "reddit", "arctic-shift"], default: "auto" },
+        verify_live: {
+          type: "string",
+          enum: ["none", "all"],
+          default: "all",
+          description:
+            "Ground-truth the post's live status via headless Chromium. 'all' (default) opens the URL and reads the current status banner — adds ~5-8s but tells you whether the post is still engageable. 'none' skips the check and returns the archived body without any status info (faster but you WILL get OP-deleted / mod-removed posts back without warning). Requires playwright + chromium.",
+        },
       },
       required: ["target"],
     },
     build: (i) => [
       "post",
       i.target,
-      ...flagArgs(i, { limit: "--limit", depth: "--depth", via: "--via" }),
+      ...flagArgs(i, {
+        limit: "--limit",
+        depth: "--depth",
+        via: "--via",
+        verify_live: "--verify-live",
+      }),
     ],
   },
   get_subreddit_feed: {
