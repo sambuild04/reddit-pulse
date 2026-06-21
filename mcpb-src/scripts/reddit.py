@@ -22,6 +22,14 @@ from datetime import datetime, timezone
 UA = "reddit-parser-skill/0.2 (Claude skill, stdlib-only)"
 BASE = "https://www.reddit.com"
 ARCTIC = "https://arctic-shift.photon-reddit.com"
+HN_FIREBASE = "https://hacker-news.firebaseio.com/v0"
+HN_ALGOLIA = "https://hn.algolia.com/api/v1"
+
+# Source-specific permalink base for rendering.
+PERMALINK_BASE = {
+    "reddit": "https://www.reddit.com",
+    "hn": "https://news.ycombinator.com",
+}
 
 
 def die(msg, code=1):
@@ -142,6 +150,168 @@ def extract_post_id(target):
     return target
 
 
+# ---------------------------------------------------------------------------
+# Hacker News adapters: convert HN API responses to the same Reddit-listing
+# shape the renderer expects so cmd_search / cmd_post / cmd_feed / cmd_user
+# can stay source-agnostic.
+# ---------------------------------------------------------------------------
+
+def fetch_hn(path, params=None):
+    """Fetch from HN Firebase OR Algolia. `path` is full URL or path with leading /."""
+    if path.startswith("http"):
+        url = path
+    else:
+        url = f"{HN_FIREBASE}{path}"
+    try:
+        return _http_get(url, params)
+    except urllib.error.HTTPError as e:
+        die(f"HN HTTP {e.code}: {url}")
+    except urllib.error.URLError as e:
+        die(f"HN network error: {e}")
+
+
+def hn_item_to_data(item):
+    """Convert one HN Firebase item (story/comment) into Reddit-listing data shape."""
+    if not item:
+        return None
+    return {
+        "id": str(item.get("id", "")),
+        "title": item.get("title", "") or item.get("story_title", "") or "(no title)",
+        "selftext": item.get("text", "") or "",
+        "body": item.get("text", "") or "",
+        "author": item.get("by") or "[deleted]",
+        "score": item.get("score") or item.get("points") or 0,
+        "num_comments": item.get("descendants", 0),
+        "created_utc": item.get("time") or item.get("created_at_i"),
+        "url": item.get("url"),
+        "permalink": f"/item?id={item.get('id')}",
+        "subreddit": "HackerNews",
+        "archived": False,
+        "deleted": bool(item.get("deleted")),
+        "dead": bool(item.get("dead")),
+        "_source": "hn",
+        "_kids": item.get("kids") or [],
+    }
+
+
+def hn_algolia_hit_to_data(hit):
+    """Convert one Algolia search hit into Reddit-listing data shape."""
+    return {
+        "id": str(hit.get("objectID", "")),
+        "title": hit.get("title") or hit.get("story_title") or "(no title)",
+        "selftext": hit.get("story_text") or "",
+        "body": hit.get("comment_text") or "",
+        "author": hit.get("author") or "[deleted]",
+        "score": hit.get("points", 0),
+        "num_comments": hit.get("num_comments", 0),
+        "created_utc": hit.get("created_at_i"),
+        "url": hit.get("url"),
+        "permalink": f"/item?id={hit.get('objectID')}",
+        "subreddit": "HackerNews",
+        "archived": False,
+        "_source": "hn",
+    }
+
+
+def hn_after_from_t(t):
+    """Map our --t window to a unix-second cutoff for Algolia search."""
+    if not t or t == "all":
+        return None
+    secs = _TIME_WINDOWS.get(t)
+    if secs is None:
+        return None
+    return int(datetime.now(timezone.utc).timestamp()) - secs
+
+
+def hn_search(query, sort="relevance", limit=15, t="all", tags="story"):
+    """Search HN via Algolia. Returns Reddit-shaped children list."""
+    endpoint = "/search_by_date" if sort == "new" else "/search"
+    params = {"query": query, "tags": tags, "hitsPerPage": min(limit, 100)}
+    after = hn_after_from_t(t)
+    if after:
+        params["numericFilters"] = f"created_at_i>{after}"
+    qs = urllib.parse.urlencode(params)
+    j = fetch_hn(f"{HN_ALGOLIA}{endpoint}?{qs}")
+    return [
+        {"kind": "t3", "data": hn_algolia_hit_to_data(h)}
+        for h in (j or {}).get("hits", [])
+    ]
+
+
+def hn_feed(sort="hot", limit=25):
+    """Get a HN feed. sort: hot→topstories, new→newstories, top→beststories, ask→askstories, show→showstories, job→jobstories, rising→newstories (HN has no rising)."""
+    endpoint_map = {
+        "hot": "topstories", "new": "newstories", "top": "beststories",
+        "rising": "newstories", "ask": "askstories", "show": "showstories",
+        "job": "jobstories",
+    }
+    endpoint = endpoint_map.get(sort, "topstories")
+    ids = fetch_hn(f"/{endpoint}.json") or []
+    children = []
+    for item_id in ids[:limit]:
+        item = fetch_hn(f"/item/{item_id}.json")
+        if item:
+            children.append({"kind": "t3", "data": hn_item_to_data(item)})
+    return children, endpoint
+
+
+def hn_user_activity(name, what="overview", limit=15):
+    """Fetch a HN user's profile + recent submissions/comments."""
+    profile = fetch_hn(f"/user/{name}.json")
+    if not profile:
+        die(f"HN user not found: {name}")
+    submitted = (profile.get("submitted") or [])[: limit * 3]  # overfetch — many may filter out
+    children = []
+    for item_id in submitted:
+        item = fetch_hn(f"/item/{item_id}.json")
+        if not item:
+            continue
+        kind = "t1" if item.get("type") == "comment" else "t3"
+        if what == "submitted" and kind != "t3":
+            continue
+        if what == "comments" and kind != "t1":
+            continue
+        children.append({"kind": kind, "data": hn_item_to_data(item)})
+        if len(children) >= limit:
+            break
+    return profile, children
+
+
+def hn_fetch_post(target, comment_limit, depth):
+    """Fetch one HN item by id/URL and build a comment tree."""
+    target = target.strip()
+    if "id=" in target:
+        post_id = target.split("id=")[1].split("&")[0]
+    elif "/item/" in target:
+        post_id = target.split("/item/")[1].split(".")[0].split("?")[0]
+    else:
+        post_id = target.lstrip("#")
+    item = fetch_hn(f"/item/{post_id}.json")
+    if not item:
+        die(f"HN item not found: {post_id}")
+    post = hn_item_to_data(item)
+
+    def fetch_kids(kid_ids, cur_depth):
+        out = []
+        for kid_id in (kid_ids or [])[:comment_limit]:
+            kid = fetch_hn(f"/item/{kid_id}.json")
+            if not kid:
+                continue
+            kid_data = hn_item_to_data(kid)
+            kid_data["body"] = kid.get("text", "")  # render_comment_tree reads .body
+            replies = ""
+            if cur_depth + 1 < depth and kid_data.get("_kids"):
+                sub = fetch_kids(kid_data["_kids"], cur_depth + 1)
+                if sub:
+                    replies = {"data": {"children": sub}}
+            kid_data["replies"] = replies
+            out.append({"kind": "t1", "data": kid_data})
+        return out
+
+    comments = fetch_kids(post.get("_kids", []), 0)
+    return post, comments
+
+
 def render_comment_tree(children, max_depth, body_chars=500):
     """Render a Reddit-style nested comment listing as markdown bullets."""
     lines = []
@@ -218,10 +388,16 @@ REDDIT_DEFAULT_ARCHIVE_DAYS = 180  # Reddit auto-archives posts at ~6 months by 
 
 
 def liveness_check(item_data, max_age_days=None):
-    """Heuristic live-status guess for an Arctic Shift snapshot.
+    """Heuristic live-status guess for an Arctic Shift snapshot or HN item.
     Returns (status, reason) where status is one of: 'live', 'removed', 'deleted',
     'likely_archived', 'suspicious'.
     """
+    # HN-specific status flags come from the API directly — no guessing needed.
+    if item_data.get("deleted"):
+        return "deleted", "HN: item marked deleted by author"
+    if item_data.get("dead"):
+        return "removed", "HN: item marked dead (flagged or auto-killed)"
+
     selftext = (item_data.get("selftext") or item_data.get("body") or "").strip()
     author = (item_data.get("author") or "").strip()
     if selftext in ("[removed]", "[ Removed by Reddit ]"):
@@ -388,10 +564,78 @@ def verify_live_status(children, mode):
 
 
 # ---------------------------------------------------------------------------
+# shared rendering helpers (source-aware)
+# ---------------------------------------------------------------------------
+
+def _render_items(out, children, args, source="reddit"):
+    """Append rendered post entries to `out`. Source-aware permalink prefix,
+    author prefix, and per-post comment fetcher. Used by cmd_search and cmd_feed
+    so the HN and Reddit paths share rendering code instead of duplicating it.
+    """
+    url_base = PERMALINK_BASE.get(source, PERMALINK_BASE["reddit"])
+    author_pre = "" if source == "hn" else "u/"
+    for c in children:
+        d = c["data"]
+        tag = " 📦" if d.get("archived") else ""
+        if c.get("_liveness"):
+            status, _ = c["_liveness"]
+            if status != "live":
+                tag += f" `[{status}]`"
+        sub_label = "HN" if source == "hn" else f"r/{d.get('subreddit', '?')}"
+        out.append(f"## {d['title']}{tag}")
+        out.append(
+            f"{sub_label} • by {author_pre}{d['author']} • score {d.get('score', 0)} • {d.get('num_comments', 0)} comments • {fmt_when(d['created_utc'])}"
+        )
+        out.append(f"{url_base}{d['permalink']}")
+        if source == "hn" and d.get("url"):
+            out.append(f"link → {d['url']}")
+        if d.get("selftext"):
+            body = d["selftext"].strip() if args.with_context else truncate(d["selftext"], 300)
+            out.append("")
+            out.append(body)
+        if args.with_context and args.with_context > 0:
+            if source == "hn":
+                _render_hn_comments(out, d.get("_kids") or [], args.with_context)
+            else:
+                post_id = d.get("id") or extract_post_id(d.get("permalink", ""))
+                if post_id:
+                    tree, c_err = fetch_comments_for_post(post_id, args.with_context)
+                    if c_err is None and tree:
+                        out.append("")
+                        out.append(f"**Top {len(tree)} comments:**")
+                        out.extend(render_comment_tree(tree, max_depth=2, body_chars=400))
+                    elif c_err is not None:
+                        out.append(f"\n_(comments unavailable: {c_err})_")
+        out.append("")
+
+
+def _render_hn_comments(out, kid_ids, n):
+    """Render top-N HN comments as flat bullets. Skips deleted/dead items."""
+    collected = []
+    for kid_id in (kid_ids or []):
+        if len(collected) >= n:
+            break
+        kid = fetch_hn(f"/item/{kid_id}.json")
+        if not kid or kid.get("deleted") or kid.get("dead"):
+            continue
+        body = (kid.get("text") or "").strip().replace("\n", " ")
+        collected.append((kid.get("by", "?"), kid.get("time"), body))
+    if not collected:
+        return
+    out.append("")
+    out.append(f"**Top {len(collected)} comments:**")
+    for author, t, body in collected:
+        out.append(f"- **u/{author}** • {fmt_when(t)}")
+        out.append(f"  {truncate(body, 400)}")
+
+
+# ---------------------------------------------------------------------------
 # subcommands
 # ---------------------------------------------------------------------------
 
 def cmd_rules(args):
+    if getattr(args, "source", "reddit") == "hn":
+        die("HN has no per-board rules — Hacker News uses a single sitewide guidelines page at https://news.ycombinator.com/newsguidelines.html")
     sub = normalize_sub(args.sub)
     data = fetch(f"/r/{sub}/about/rules")
     rules = data.get("rules", [])
@@ -422,6 +666,8 @@ def cmd_rules(args):
 
 
 def cmd_about(args):
+    if getattr(args, "source", "reddit") == "hn":
+        die("HN has no subreddit metadata — Hacker News is a single board.")
     sub = normalize_sub(args.sub)
     j = fetch(f"/r/{sub}/about")
     d = j["data"]
@@ -446,6 +692,8 @@ def cmd_about(args):
 
 
 def cmd_wiki(args):
+    if getattr(args, "source", "reddit") == "hn":
+        die("HN has no per-board wikis.")
     sub = normalize_sub(args.sub)
     page = args.page or "index"
     j = fetch(f"/r/{sub}/wiki/{page}")
@@ -462,6 +710,26 @@ def cmd_wiki(args):
 
 
 def cmd_feed(args):
+    if args.source == "hn":
+        children, endpoint = hn_feed(sort=args.sort, limit=args.limit)
+        children = filter_archived(children, args.archived)
+        children = annotate_liveness(children, args.max_age_days or None)
+        children = filter_by_liveness(children, args.liveness)
+        header = f"# HN — {args.sort} (via /v0/{endpoint})"
+        if args.liveness != "include":
+            header += f", liveness={args.liveness}"
+        out = [header, ""]
+        # HN feed renders posts only; reuse the listing renderer.
+        # cmd_feed doesn't accept with_context today, but the renderer handles
+        # the absence gracefully.
+        if not hasattr(args, "with_context"):
+            args.with_context = 0
+        _render_items(out, children, args, source="hn")
+        print("\n".join(out))
+        return
+
+    if not args.sub:
+        die("feed: --source reddit requires a subreddit name (positional `sub` arg)")
     sub = normalize_sub(args.sub)
     via = pick_via(args, "feed", sort=args.sort)
     children = None
@@ -520,6 +788,33 @@ def cmd_feed(args):
 
 
 def cmd_post(args):
+    if args.source == "hn":
+        post, comments = hn_fetch_post(args.target, args.limit, args.depth)
+        out = [f"# {post['title']}  _(via HN)_", ""]
+        if post.get("deleted"):
+            out.append("> ⚠ **This item is deleted on Hacker News.**")
+            out.append("")
+        elif post.get("dead"):
+            out.append("> ⚠ **This item is dead on Hacker News** (flagged or auto-killed).")
+            out.append("")
+        out.append(
+            f"HN • by {post['author']} • {post.get('score', 0)} pts • {post.get('num_comments', 0)} comments"
+        )
+        out.append(f"Posted: {fmt_when(post['created_utc'])}")
+        out.append(f"URL: https://news.ycombinator.com{post['permalink']}")
+        if post.get("url"):
+            out.append(f"Linked URL: {post['url']}")
+        out.append("")
+        if post.get("selftext"):
+            out.append("## Body")
+            out.append(post["selftext"].strip())
+            out.append("")
+        out.append(f"## Top comments (up to {args.limit}, depth {args.depth})")
+        out.append("")
+        out.extend(render_comment_tree(comments, args.depth))
+        print("\n".join(out))
+        return
+
     target = args.target.strip()
     via = pick_via(args, "post")
     post = comments = None
@@ -612,6 +907,41 @@ def cmd_post(args):
 
 
 def cmd_user(args):
+    if args.source == "hn":
+        name = normalize_user(args.name)
+        profile, children = hn_user_activity(name, what=args.what, limit=args.limit)
+        out = [f"# {name}  _(HN profile)_"]
+        out += [
+            f"- Created: {fmt_when(profile.get('created'))}",
+            f"- Karma: {profile.get('karma', 0):,}",
+        ]
+        if profile.get("about"):
+            out.append(f"- About: {truncate(profile['about'], 200)}")
+        children = filter_by_liveness(annotate_liveness(children, args.max_age_days or None), args.liveness)
+        out.append("")
+        out.append(f"## Recent {args.what}")
+        out.append("")
+        url_base = PERMALINK_BASE["hn"]
+        for c in children:
+            d = c["data"]
+            tag = ""
+            if c.get("_liveness") and c["_liveness"][0] != "live":
+                tag = f" `[{c['_liveness'][0]}]`"
+            if c["kind"] == "t3":
+                out.append(f"### [post]{tag} {d['title']}")
+                out.append(f"HN • {d.get('score', 0)} pts • {fmt_when(d['created_utc'])}")
+                out.append(f"{url_base}{d['permalink']}")
+                if d.get("selftext"):
+                    out.append(truncate(d["selftext"], 300))
+            else:
+                out.append(f"### [comment]{tag}")
+                out.append(f"{d.get('score', 0)} pts • {fmt_when(d['created_utc'])}")
+                out.append(f"{url_base}{d['permalink']}")
+                out.append(truncate(d.get("body", ""), 300))
+            out.append("")
+        print("\n".join(out))
+        return
+
     name = normalize_user(args.name)
     via = pick_via(args, "user")
     out = [f"# u/{name}  _(activity via {via})_"]
@@ -699,6 +1029,20 @@ def cmd_user(args):
 
 
 def cmd_search(args):
+    # Source dispatch: HN uses its own API stack, no backend routing or Playwright.
+    if args.source == "hn":
+        children = hn_search(args.query, sort=args.sort, limit=args.limit, t=args.t)
+        children = filter_archived(children, args.archived)
+        children = annotate_liveness(children, args.max_age_days or None)
+        children = filter_by_liveness(children, args.liveness)
+        header = f"# HN search: {args.query} — via Algolia"
+        if args.liveness != "include":
+            header += f", liveness={args.liveness}"
+        out = [header, ""]
+        _render_items(out, children, args, source="hn")
+        print("\n".join(out))
+        return
+
     sub_norm = normalize_sub(args.sub) if args.sub else None
     via = pick_via(args, "search")
     children = None
@@ -783,6 +1127,15 @@ def main():
     p = argparse.ArgumentParser(prog="reddit", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = p.add_subparsers(dest="cmd", required=True)
 
+    source_parent = argparse.ArgumentParser(add_help=False)
+    source_parent.add_argument(
+        "--source", choices=["reddit", "hn"], default="reddit",
+        help="which platform to query. 'reddit' (default) uses Reddit + Arctic Shift. "
+             "'hn' uses Hacker News's Firebase + Algolia APIs (no auth, no Playwright needed — "
+             "deleted/dead flags come straight from the API). rules/about/wiki commands are "
+             "Reddit-only.",
+    )
+
     via_parent = argparse.ArgumentParser(add_help=False)
     via_parent.add_argument(
         "--via", choices=["reddit", "arctic-shift", "auto"], default="auto",
@@ -808,22 +1161,24 @@ def main():
              "Requires playwright + chromium installed.",
     )
 
-    r = sp.add_parser("rules", help="subreddit rules")
+    r = sp.add_parser("rules", help="subreddit rules", parents=[source_parent])
     r.add_argument("sub")
     r.set_defaults(fn=cmd_rules)
 
-    a = sp.add_parser("about", help="subreddit metadata + sidebar")
+    a = sp.add_parser("about", help="subreddit metadata + sidebar", parents=[source_parent])
     a.add_argument("sub")
     a.set_defaults(fn=cmd_about)
 
-    w = sp.add_parser("wiki", help="subreddit wiki page")
+    w = sp.add_parser("wiki", help="subreddit wiki page", parents=[source_parent])
     w.add_argument("sub")
     w.add_argument("page", nargs="?", default=None)
     w.set_defaults(fn=cmd_wiki)
 
-    f = sp.add_parser("feed", help="subreddit feed", parents=[via_parent, liveness_parent])
-    f.add_argument("sub")
-    f.add_argument("--sort", choices=["hot", "new", "top", "rising"], default="hot")
+    f = sp.add_parser("feed", help="subreddit feed", parents=[source_parent, via_parent, liveness_parent])
+    f.add_argument("sub", nargs="?", default=None,
+                   help="subreddit (Reddit-only — ignored when --source hn)")
+    f.add_argument("--sort", choices=["hot", "new", "top", "rising", "best", "ask", "show", "job"], default="hot",
+                   help="hot/new/top/rising work for both sources. best/ask/show/job are HN-only.")
     f.add_argument("--t", choices=["hour", "day", "week", "month", "year", "all"], default="day",
                    help="time window (only used with --sort top)")
     f.add_argument("--limit", type=int, default=25)
@@ -831,13 +1186,13 @@ def main():
                    help="filter by archived status (default: include all)")
     f.set_defaults(fn=cmd_feed)
 
-    po = sp.add_parser("post", help="post body + top comments", parents=[via_parent, liveness_parent])
+    po = sp.add_parser("post", help="post body + top comments", parents=[source_parent, via_parent, liveness_parent])
     po.add_argument("target", help="post URL or bare post id")
     po.add_argument("--limit", type=int, default=20)
     po.add_argument("--depth", type=int, default=2)
     po.set_defaults(fn=cmd_post)
 
-    u = sp.add_parser("user", help="user profile + activity", parents=[via_parent, liveness_parent])
+    u = sp.add_parser("user", help="user profile + activity", parents=[source_parent, via_parent, liveness_parent])
     u.add_argument("name")
     u.add_argument("--what", choices=["submitted", "comments", "overview"], default="overview")
     u.add_argument("--limit", type=int, default=15)
@@ -845,7 +1200,7 @@ def main():
                    help="filter by archived status (default: include all)")
     u.set_defaults(fn=cmd_user)
 
-    s = sp.add_parser("search", help="search reddit", parents=[via_parent, liveness_parent])
+    s = sp.add_parser("search", help="search reddit", parents=[source_parent, via_parent, liveness_parent])
     s.add_argument("query")
     s.add_argument("--sub", default=None, help="restrict to a subreddit")
     s.add_argument("--limit", type=int, default=15)

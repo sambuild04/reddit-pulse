@@ -51,8 +51,9 @@ const TOOLS = {
     inputSchema: {
       type: "object",
       properties: {
+        source: { type: "string", enum: ["reddit", "hn"], default: "reddit", description: "Which platform to search. 'reddit' (default) uses Reddit's JSON / Arctic Shift. 'hn' uses Hacker News's Algolia search. When 'hn', `subreddit` is ignored and `verify_live` is skipped (HN's API returns deleted/dead flags directly)." },
         query: { type: "string", description: "Search keywords" },
-        subreddit: { type: "string", description: "Restrict to a subreddit (e.g. 'LearnJapanese' or 'r/LearnJapanese')" },
+        subreddit: { type: "string", description: "Restrict to a subreddit (Reddit only — ignored if source='hn')" },
         sort: { type: "string", enum: ["relevance", "hot", "top", "new", "comments"], default: "relevance" },
         t: { type: "string", enum: ["hour", "day", "week", "month", "year", "all"], default: "all", description: "Time window" },
         limit: { type: "integer", default: 15, minimum: 1, maximum: 100 },
@@ -69,6 +70,7 @@ const TOOLS = {
       "search",
       i.query,
       ...flagArgs(i, {
+        source: "--source",
         subreddit: "--sub",
         sort: "--sort",
         t: "--t",
@@ -88,10 +90,11 @@ const TOOLS = {
     inputSchema: {
       type: "object",
       properties: {
-        target: { type: "string", description: "Post URL (full reddit.com link) or bare id like 'abc123'" },
+        source: { type: "string", enum: ["reddit", "hn"], default: "reddit", description: "Platform. 'hn' fetches via Hacker News Firebase API; target should be an HN id, news.ycombinator.com URL, or item link." },
+        target: { type: "string", description: "Reddit post URL/id (source=reddit) or HN item id/URL (source=hn)" },
         limit: { type: "integer", default: 20, description: "Max number of top comments" },
         depth: { type: "integer", default: 2, description: "Max comment nesting depth" },
-        via: { type: "string", enum: ["auto", "reddit", "arctic-shift"], default: "auto" },
+        via: { type: "string", enum: ["auto", "reddit", "arctic-shift"], default: "auto", description: "Reddit backend selection — ignored if source='hn'" },
         verify_live: {
           type: "string",
           enum: ["none", "all"],
@@ -106,6 +109,7 @@ const TOOLS = {
       "post",
       i.target,
       ...flagArgs(i, {
+        source: "--source",
         limit: "--limit",
         depth: "--depth",
         via: "--via",
@@ -118,8 +122,9 @@ const TOOLS = {
     inputSchema: {
       type: "object",
       properties: {
-        subreddit: { type: "string", description: "Subreddit name (no r/ prefix needed)" },
-        sort: { type: "string", enum: ["hot", "new", "top", "rising"], default: "hot" },
+        source: { type: "string", enum: ["reddit", "hn"], default: "reddit", description: "Platform. When 'hn', the `subreddit` arg is ignored and sort can include best/ask/show/job." },
+        subreddit: { type: "string", description: "Subreddit name (Reddit only; ignored if source='hn')" },
+        sort: { type: "string", enum: ["hot", "new", "top", "rising", "best", "ask", "show", "job"], default: "hot", description: "hot/new/top/rising for both. best/ask/show/job are HN-only." },
         t: { type: "string", enum: ["hour", "day", "week", "month", "year", "all"], default: "day", description: "Time window (only meaningful with sort=top)" },
         limit: { type: "integer", default: 25 },
         via: { type: "string", enum: ["auto", "reddit", "arctic-shift"], default: "auto" },
@@ -132,8 +137,9 @@ const TOOLS = {
     },
     build: (i) => [
       "feed",
-      i.subreddit,
+      ...(i.source === "hn" ? [] : [i.subreddit || ""]),
       ...flagArgs(i, {
+        source: "--source",
         sort: "--sort",
         t: "--t",
         limit: "--limit",
@@ -150,7 +156,8 @@ const TOOLS = {
     inputSchema: {
       type: "object",
       properties: {
-        username: { type: "string", description: "Reddit username (no u/ prefix needed)" },
+        source: { type: "string", enum: ["reddit", "hn"], default: "reddit", description: "Platform. 'hn' fetches a HN profile (karma, created, about) and recent submissions/comments via Firebase." },
+        username: { type: "string", description: "Reddit username or HN handle (no u/ prefix needed)" },
         what: { type: "string", enum: ["submitted", "comments", "overview"], default: "overview" },
         limit: { type: "integer", default: 15 },
         via: { type: "string", enum: ["auto", "reddit", "arctic-shift"], default: "auto" },
@@ -165,6 +172,7 @@ const TOOLS = {
       "user",
       i.username,
       ...flagArgs(i, {
+        source: "--source",
         what: "--what",
         limit: "--limit",
         via: "--via",
