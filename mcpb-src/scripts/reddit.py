@@ -447,6 +447,33 @@ _PLAYWRIGHT_UA = (
     "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 )
 
+# Reddit's new UI wraps post content in <shreddit-post> custom elements that
+# use Shadow DOM. document.body.innerText does NOT traverse Shadow DOM, so the
+# deletion / removal banners (which are inside shadow trees) are invisible
+# to a naive innerText read. This JS walks the full tree including every
+# open shadow root and returns the concatenated visible text.
+_PAGE_TEXT_JS = """
+() => {
+    const lines = [];
+    function walk(node) {
+        if (!node) return;
+        if (node.nodeType === 3) { // TEXT_NODE
+            const t = node.nodeValue;
+            if (t && t.trim()) lines.push(t);
+            return;
+        }
+        if (node.shadowRoot) {
+            node.shadowRoot.childNodes.forEach(walk);
+        }
+        if (node.childNodes) {
+            node.childNodes.forEach(walk);
+        }
+    }
+    walk(document.documentElement);
+    return lines.join(' ');
+}
+"""
+
 
 def _classify_live_text(text):
     t = (text or "").lower().replace("’", "'")  # normalize curly apostrophe
@@ -502,11 +529,11 @@ def verify_live_one(url):
             except Exception:
                 pass
             page.wait_for_timeout(2500)
-            text = page.evaluate("() => document.body.innerText")
+            text = page.evaluate(_PAGE_TEXT_JS)
             status, reason = _classify_live_text(text)
             if status == "live" and len(text) < 400:
                 page.wait_for_timeout(2500)
-                text = page.evaluate("() => document.body.innerText")
+                text = page.evaluate(_PAGE_TEXT_JS)
                 status, reason = _classify_live_text(text)
             return status, reason
         except Exception as e:
@@ -553,13 +580,13 @@ def verify_live_status(children, mode):
                 except Exception:
                     pass  # reddit rarely reaches networkidle; that's fine
                 page.wait_for_timeout(2500)
-                text = page.evaluate("() => document.body.innerText")
+                text = page.evaluate(_PAGE_TEXT_JS)
                 status, reason = _classify_live_text(text)
                 # If we got "live" but the page text is implausibly short, the banner
                 # likely hasn't rendered yet — wait once more and re-read.
                 if status == "live" and len(text) < 400:
                     page.wait_for_timeout(2500)
-                    text = page.evaluate("() => document.body.innerText")
+                    text = page.evaluate(_PAGE_TEXT_JS)
                     status, reason = _classify_live_text(text)
                 children[i]["_liveness"] = (status, reason)
             except Exception as e:

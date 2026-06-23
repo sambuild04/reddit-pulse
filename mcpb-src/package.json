@@ -1,6 +1,6 @@
 {
   "name": "forum-pulse-mcpb",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "description": "MCP server for Forum Pulse \u2014 Reddit + Hacker News research from Claude Desktop, no auth required.",
   "type": "module",
   "main": "server/index.js",

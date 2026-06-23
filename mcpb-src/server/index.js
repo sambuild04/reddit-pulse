@@ -217,7 +217,7 @@ const TOOLS = {
 };
 
 const server = new Server(
-  { name: "forum-pulse", version: "0.6.3" },
+  { name: "forum-pulse", version: "0.6.4" },
   { capabilities: { tools: {} } },
 );
 
