@@ -450,7 +450,16 @@ _PLAYWRIGHT_UA = (
 
 def _classify_live_text(text):
     t = (text or "").lower().replace("’", "'")  # normalize curly apostrophe
-    if "deleted by the person who originally posted" in t or "deleted by the user" in t:
+    # OP-delete shows up several ways depending on UI version:
+    #   - Old banner: "Sorry, this post was deleted by the person who originally posted it."
+    #   - Newer banner: "deleted by the user"
+    #   - Newest UI (2026): the title itself is replaced with "[deleted by user]" — no banner.
+    if (
+        "deleted by the person who originally posted" in t
+        or "deleted by the user" in t
+        or "[deleted by user]" in t
+        or "[deleted by reddit]" in t
+    ):
         return "deleted", "live page: user-deleted"
     # Order matters: more-specific phrases first, since they overlap with the generic ones.
     if "removed by reddit's filters" in t or "removed by reddit's automod" in t:
